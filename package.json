@@ -28,7 +28,7 @@
 	"scripts": {
 		"build": "yarn clean && tsc",
 		"build-win": "yarn clean-win && tsc",
-		"clean-win": "rmdir /s /q lib",
+		"clean-win": "if exist lib ( rmdir /s /q lib )",
 		"clean": "rm -rf lib",
 		"start": "node lib/index.js",
 		"prettify": "prettier --check './src/**/*.ts'",
