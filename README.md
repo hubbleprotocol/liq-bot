@@ -5,6 +5,6 @@
 > Polling Account Fetcher for account retrieval (5k accounts per second)  
 ```
 yarn install
-yarn build-win | yarn build
+yarn build
 yarn start
 ```
