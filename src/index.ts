@@ -6,7 +6,7 @@ import * as bs58 from 'bs58';
 import { BorrowingMarketState, CollateralAmounts, CollateralInfo, CollateralTokenActive, Config, EventStatus, LiquidationsQueue, SystemMode, TokenMap, TokenPrices, UserMetadata } from "./types";
 import BN from 'bn.js';
 import { TpuConnection } from "./tpuClient";
-import { PriceData, parsePriceData } from "@pythnetwork/client";
+import { PriceData, parsePriceData, PriceStatus } from "@pythnetwork/client";
 import { DECIMAL_FACTOR, STABLECOIN_DECIMALS, LAMPORTS_PER_SOL, DECIMALS_BTC, LAMPORTS_PER_MSOL, DECIMALS_RAY, DECIMALS_FTT, DECIMALS_ETH, DECIMALS_SRM } from "@hubbleprotocol/hubble-sdk";
 import Decimal from "decimal.js";
 
@@ -70,7 +70,7 @@ class Bot {
         // retrieve the configs from the https api
         const configs = await getConfigs();
 
-        const liquidator = await Liquidator.load(process.env.RPC_URL, process.env.CLUSTER as Cluster, idl, configs);
+        const liquidator = await Liquidator.load(idl, configs);
         return new Bot(liquidator);
     }
 
@@ -93,7 +93,7 @@ class Bot {
             const bot = (this as Bot);
             if (JSON.stringify(bot.liquidator.idl) !== JSON.stringify(idl) && JSON.stringify(bot.liquidator.configs) !== JSON.stringify(configs)) {
                 bot.stop();
-                bot.liquidator = await Liquidator.load(process.env.RPC_URL, process.env.CLUSTER as Cluster, idl, configs);
+                bot.liquidator = await Liquidator.load(idl, configs);
                 bot.start();
             }
             
@@ -159,14 +159,17 @@ export class Liquidator {
     liquidatorAssociatedTokenAccounts: LiquidatorAssociatedTokenAccounts
     userMetadataMap: Map<string, UserMetadata>;
     liquidationIXMap: Map<string, TransactionInstruction>;
+    clearLiquidationGainsIXMap: Map<string, TransactionInstruction>;
     pollingAccountsFetcher: PollingAccountsFetcher;
     blockhash: string
     prices: TokenPrices
     mcr: BN | Decimal
 
 
-    async getClearLiquidationGainsIX(token: CollateralTokenActive, clearerAassociatedTokenAccount: PublicKey) : Promise<TransactionInstruction> {
-        const args = [token];
+    // create the clearLiquidationGains TransactionInstruction for the liquidator running this bot
+    // will need to be called for each token
+    async getClearLiquidationGainsIX(token: string, clearerAassociatedTokenAccount: PublicKey) : Promise<TransactionInstruction> {
+        const args = [CollateralTokenActive[token]];
         const keys = [
             {
                 pubkey: this.hubbleProgram.provider.wallet.publicKey, // clearingAgent
@@ -209,7 +212,7 @@ export class Liquidator {
                 isSigner: false
             },
             {
-                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts.collateralVault[CollateralTokenActive[token][0] + CollateralTokenActive[token].substring(1).toLowerCase()]), // collateralVault
+                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts.collateralVault[token]), // collateralVault
                 isWritable: true,
                 isSigner: false
             },
@@ -219,7 +222,7 @@ export class Liquidator {
                 isSigner: false
             },
             {
-                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts['liquidationRewardsVault' + CollateralTokenActive[token][0] + CollateralTokenActive[token].substring(1).toLowerCase()]), // liquidationRewardsVault
+                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts['liquidationRewardsVault' + token[0] + token.substring(1).toLowerCase()]), // liquidationRewardsVault
                 isWritable: false,
                 isSigner: false
             },
@@ -242,6 +245,7 @@ export class Liquidator {
         
     }
     
+    // create the `tryLiquidate` TransactionInstruction for specified UserMetadata account
     async getTryLiquidateIX(userMetadata: PublicKey): Promise<TransactionInstruction> {
         const args = [];
         const keys = [
@@ -315,9 +319,9 @@ export class Liquidator {
                 isWritable: false,
                 isSigner: false
             },
-        ].concat(...Object.keys(CollateralTokenActive).filter(token => isNaN(CollateralTokenActive[token])).map(token => {
+        ].concat(...Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))).map(token => {
             return {
-                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts.pyth[CollateralTokenActive[token].toLowerCase() + 'PriceInfo']), // pythSolPriceInfo
+                pubkey: new PublicKey(this.clusterConfig.borrowing.accounts.pyth[token.toLowerCase() + 'PriceInfo']), // pythPriceInfo
                 isWritable: false,
                 isSigner: false
             };
@@ -341,11 +345,12 @@ export class Liquidator {
     }
 
 
+    // clear the liquidation queue
     async clearLiquidationQueue() : Promise<void> {
 
-        // loop through each liquidation event
+        // filter the liquidation queue for events which are pending collection
         const filteredLiquidationQueue = this.liquidationsQueue.events.filter(e => e.status.toNumber() === EventStatus.PendingCollection);
-
+        // loop through each liquidation event
         await Promise.all(filteredLiquidationQueue.map((pendingEvent, index) => {
             return new Promise((resolve) => { 
                 // 1 second timeout per liquidation event
@@ -356,14 +361,15 @@ export class Liquidator {
         }));
     }
 
+    //
     async clearLiquidationGains() : Promise<Array<string>> {
-        const chunkOf5Tokens = chunk(Object.keys(CollateralTokenActive).filter(token => isNaN(CollateralTokenActive[token])), 5) as Array<Array<string>>;
+        const chunkOf5Tokens = chunk(Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))), 5) as Array<Array<string>>;
         return flat(await Promise.all(chunkOf5Tokens.map(async (chunkedTokenAccounts, chunkIndex) => {
             return new Promise((resolve) => {
                 setTimeout(() => {
                     const tx = new Transaction();
                     chunkedTokenAccounts.forEach(async tokenAccount => {
-                        tx.add(await this.getClearLiquidationGainsIX(CollateralTokenActive[tokenAccount], new PublicKey(this.liquidatorAssociatedTokenAccounts[CollateralTokenActive[tokenAccount]])));
+                        tx.add(this.clearLiquidationGainsIXMap.get(CollateralTokenActive[tokenAccount]));
                     });
                     tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
                     tx.recentBlockhash = this.blockhash;
@@ -408,6 +414,7 @@ export class Liquidator {
 
     }
 
+    // 
     async getPendingCollateral(user : UserMetadata) : Promise<CollateralAmounts> {
         const diffCollRpt = this.zeroCollateral() as CollateralAmounts;
         Object.keys(this.borrowingMarketState.collateralRewardPerToken).filter(key => !Array.isArray(this.borrowingMarketState.collateralRewardPerToken[key])).forEach(key => {
@@ -442,17 +449,25 @@ export class Liquidator {
     }
 
     lamportsToDecimal(collateralAmounts: CollateralAmounts) : CollateralAmounts {
+        // create a new collateral amounts object to avoid modifying the data associated with the user metadata
         const newCollateralAmounts = { } as CollateralAmounts;
+
+        // filter through the collateral amounts parameter and divide by the precision based on the asset
         Object.keys(collateralAmounts).filter(key => !Array.isArray(collateralAmounts[key])).forEach(key => {
             newCollateralAmounts[key] = new Decimal(collateralAmounts[key].toString()).div(this.precisionFromKey(key));
         });
+
         return newCollateralAmounts;
     }
 
+    // add together deposited collateral, inactive collateral and pending collateral for the specified UserMetadata
     async calculateTotalCollateral(user: UserMetadata) : Promise<CollateralAmounts> {
         return await this.addCollateralAmounts([this.lamportsToDecimal(user.depositedCollateral), this.lamportsToDecimal(user.inactiveCollateral), this.lamportsToDecimal(await this.getPendingCollateral(user))]);
     }
 
+    // calculate the loans associated with each UserMetadata in the array
+    // sum(collateral * price) / debt
+    // divided by 100 to get the ratio 
     async getLoans(metadatas: Array<UserMetadata>): Promise<Array<Loan>> {
         return (await Promise.all(metadatas.filter(metadata => new Decimal(metadata.borrowedStablecoin.toString()).gt(new Decimal(0))).map(async metadata => {
             return {
@@ -468,6 +483,7 @@ export class Liquidator {
         });
     }
 
+    // get the loans for each userMetadata
     async tryLiquidateUsers() : Promise<void> {
         
         // get loan (tcr) associated with each user metadata
@@ -476,15 +492,27 @@ export class Liquidator {
 
         const loans = await this.getLoans([...this.pollingAccountsFetcher.accounts.values()].filter(acc => acc.accountKey === 'userMetadata').map(acc => acc.data as UserMetadata));
         // loop through each loan and try to liquidate
-        loans.sort((loanA, loanB) => loanA.tcr.toNumber() - loanB.tcr.toNumber()).forEach(async loan => {
-            if (!(loan.tcr as Decimal).eq(new Decimal(0)) && (loan.tcr as Decimal).lt((this.mcr as Decimal).plus(new Decimal(10 * 0.0001)))) {
-                // console.log((loan.tcr as Decimal).lt((this.mcr as Decimal).plus(new Decimal(10 * 0.0001))), loan.tcr.toNumber());
-                console.log(`${loan.metadata.metadataPk.toBase58()} has ltv ${1/(loan.tcr.toNumber()/100)} attempting to liquidate`);
-                let tx = new Transaction().add(this.liquidationIXMap.get(loan.metadata.metadataPk.toBase58()));
-                tx.recentBlockhash = this.blockhash;
-                tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
-                tx = await this.hubbleProgram.provider.wallet.signTransaction(tx);
-                (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize());
+        const sortedLoans = loans.sort((loanA, loanB) => loanA.tcr.toNumber() - loanB.tcr.toNumber());
+        // const topLoan = sortedLoans[0];
+        // if (!(topLoan.tcr as Decimal).eq(new Decimal(0))) {
+        //     console.log(`${topLoan.metadata.metadataPk.toBase58()} - ${(1/(topLoan.tcr.toNumber()/100) * 100).toFixed(2)} %`);
+        // }
+        sortedLoans.forEach(async loan => {
+            // initially all loan tcr's will be ZERO
+            if (!(loan.tcr as Decimal).eq(new Decimal(0))) {
+                const mcrRange = (this.mcr as Decimal).plus(new Decimal(10 * 0.0001));
+                const liquidatable = (loan.tcr as Decimal).lt(mcrRange);
+                const ltv = 1/(loan.tcr.toNumber()/100);
+                // console.log(`liquidatable ${liquidatable} - mcr ${mcrRange.toNumber()} - tcr: ${loan.tcr.toNumber().toFixed(2)} - ltv ${(ltv * 100).toFixed(2)}`);
+                
+                if (liquidatable) {
+                    console.log(`${loan.metadata.metadataPk.toBase58()} has ltv ${(ltv * 100).toFixed(2)} attempting to liquidate`);
+                    let tx = new Transaction().add(this.liquidationIXMap.get(loan.metadata.metadataPk.toBase58()));
+                    tx.recentBlockhash = this.blockhash;
+                    tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
+                    tx = await this.hubbleProgram.provider.wallet.signTransaction(tx);
+                    (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize());
+                }
             }
         });
 
@@ -513,6 +541,7 @@ export class Liquidator {
                     // check if this user metadata is from an old config
                     // remove from the polling accounts fetcher
                     if (userMetadata.borrowingMarketState.toBase58() !== this.clusterConfig.borrowing.accounts.borrowingMarketState) {
+                        console.log(`removing ${userMetadata.metadataPk.toBase58()} from the polling account fetcher because of difference in market state key`);
                         this.pollingAccountsFetcher.accounts.delete(userMetadata.metadataPk.toBase58());
                     }
 
@@ -584,7 +613,8 @@ export class Liquidator {
                 }));
             })).then(tokenAddresses => {
                 flat(tokenAddresses).forEach((ata: { token: string, pub: PublicKey }) => {
-                    liquidatorAssociatedTokenAccounts[ata.token] = ata.pub.toBase58();
+                    // mint uses WSOL for the key, while ActiveCollateralToken uses SOL ...
+                    liquidatorAssociatedTokenAccounts[ata.token === 'WSOL' ? 'SOL' : ata.token] = ata.pub.toBase58();
                 });
                 resolve(liquidatorAssociatedTokenAccounts);
             });
@@ -592,13 +622,23 @@ export class Liquidator {
     }
 
     // async helper function for loading the Liquidator
-    static async load(RPC_URL: string, cluster: Cluster, idl: Idl, configs: Array<Config>) : Promise<Liquidator>  {
+    static async load(idl: Idl, configs: Array<Config>) : Promise<Liquidator>  {
+
+        if (process.env.CLUSTER === undefined) {
+            console.error('please add CLUSTER env variable to .env');
+            process.exit();
+        }
+
+        if (process.env.RPC_URL === undefined) {
+            console.error('please add RPC_URL env variable to .env');
+            process.exit();
+        }
 
         // load the config pertaining to the environment of the bot
-        const clusterConfig = configs.find(c => c.env.toString() === cluster.toString());
+        const clusterConfig = configs.find(c => c.env.toString() === (process.env.CLUSTER as Cluster).toString());
         
         // create the TPU Connection (will allow us to send more tx's to the tpu leaders (not rate limited))
-        const connection = await TpuConnection.load(RPC_URL, { commitment: 'processed' });
+        const connection = await TpuConnection.load(process.env.RPC_URL, { commitment: 'processed' });
 
         // wallet used as the liquidator and to sign/send transactions
         const wallet = getWallet();
@@ -614,7 +654,7 @@ export class Liquidator {
         const blockhash = (await hubbleProgram.provider.connection.getRecentBlockhash()).blockhash;
         
         return new Liquidator(
-            cluster,
+            process.env.CLUSTER as Cluster,
             idl, 
             configs, 
             clusterConfig, 
@@ -639,19 +679,32 @@ export class Liquidator {
         this.liquidationsQueue = liquidationsQueue;
         this.blockhash = blockhash;
         
-        // first start loading the liquidator ATAs
-        this.getLiquidatorAssociatedTokenAccounts().then(liquidatorAssociatedTokenAccounts => {
-            this.liquidatorAssociatedTokenAccounts = liquidatorAssociatedTokenAccounts;
-        });
+        // init clearLiquidationGains map
+        this.clearLiquidationGainsIXMap = new Map<string, TransactionInstruction>();
 
         // init liquidation map
         this.liquidationIXMap = new Map<string, TransactionInstruction>();
+
+        // start loading the liquidator ATAs
+        // and create the clear liquidation gains IX
+        this.getLiquidatorAssociatedTokenAccounts().then(async liquidatorAssociatedTokenAccounts => {
+            this.liquidatorAssociatedTokenAccounts = liquidatorAssociatedTokenAccounts;
+            // for each active collateral token create a clear liquidation gains transaction instruction and save it to the map, since that will never change
+            Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))).forEach(async tokenAccount => {
+                this.clearLiquidationGainsIXMap.set(tokenAccount, await this.getClearLiquidationGainsIX(tokenAccount, new PublicKey(this.liquidatorAssociatedTokenAccounts[tokenAccount])));
+            });
+        });
+        
+
+        
+
+        
 
         // minimum collateral ratio
         this.mcr = new Decimal(100);
         
         // create the polling accounts fetcher
-        this.pollingAccountsFetcher = new PollingAccountsFetcher(5000);
+        this.pollingAccountsFetcher = new PollingAccountsFetcher(500);
 
         // add the liquidations queue PublicKey to the polling accounts fetcher
         this.pollingAccountsFetcher.addProgram('liquidationsQueue', clusterConfig.borrowing.accounts.liquidationsQueue, this.hubbleProgram, (async (liquidationsQueue : LiquidationsQueue) => {
@@ -689,10 +742,14 @@ export class Liquidator {
             this.pollingAccountsFetcher.addConstructAccount(this.clusterConfig.borrowing.accounts.pyth[key], (data: Buffer) => {
                 return parsePriceData(data);
             }, async (priceData: PriceData) => {
-                console.log(priceData);
-                this.prices[key.split('Price')[0]] = { value: new Decimal(priceData.price), exp: new Decimal(priceData.exponent) };
-                // calculate the minimum collateral ratio whenever the price changes
-                this.mcr = await this.calculateMcr();
+                // sometimes the price/exponent is undefined because of the pyth oracle
+                if (priceData.price && priceData.exponent) {
+                    this.prices[key.split('Price')[0]] = { value: new Decimal(priceData.price), exp: new Decimal(priceData.exponent) };
+                    // calculate the minimum collateral ratio whenever the price changes
+                    this.mcr = await this.calculateMcr();
+                } else {
+                    console.log(`Pyth Oracle: ${priceData.productAccountKey.toBase58()} - ${Object.keys(this.clusterConfig.borrowing.accounts.pyth).map(key => ({ key, value: this.clusterConfig.borrowing.accounts.pyth[key] } )).find(keyValue => keyValue.value === priceData.productAccountKey.toBase58()).key.split("Pr")[0].toUpperCase()} - price ${PriceStatus[priceData.status]}`);
+                }
             }, (error) => {
                 console.error(error);
             });
@@ -779,6 +836,31 @@ class PollingAccountsFetcher {
         
     }
 
+    axiosPost(requestChunk, retry = 0) : Promise<any> {
+        return new Promise((resolve) => {
+            const data = requestChunk.map(payload => 
+                ({
+                    jsonrpc: "2.0",
+                    id: "1",
+                    method: "getMultipleAccounts",
+                    params: [
+                        payload,
+                        { commitment: "processed" },
+                    ]
+                })
+            );
+            axios.post(process.env.RPC_URL, data).then(response => {
+                resolve(response.data);
+            }).catch(error => {
+                if (retry < 5) {
+                    this.axiosPost(requestChunk, retry+1);
+                } else {
+                    console.error(error);
+                    console.warn('failed to retrieve data 5 times in a row, aborting');
+                }
+            });
+        });
+    }
 
     async fetch() : Promise<void> {
         const accountValues = [...this.accounts.values()];
@@ -790,27 +872,14 @@ class PollingAccountsFetcher {
             return new Promise((resolve) => {
                 setTimeout(() => {
                     Promise.all(request.map((requestChunk) => {
-                        return new Promise((resolveInner) => {
-                            const data = requestChunk.map(payload => 
-                            ({
-                                jsonrpc: "2.0",
-                                id: "1",
-                                method: "getMultipleAccounts",
-                                params: [
-                                    payload,
-                                    { commitment: "processed" },
-                                ]
-                            }));
-                            axios.post(process.env.RPC_URL, data).then(response => {
-                                resolveInner(response.data);
-                            });
-                        });
+                        return this.axiosPost(requestChunk);
                     })).then(promisedResponses => {
                         resolve(flat(promisedResponses, Infinity));
                     });
                 }, index * 1000);
             });
         })), Infinity);
+
         // const end = process.hrtime(start);
         // console.log(`took ${ ((end[0] * 1000) + (end[1] / 1000000)).toFixed(2) } ms to poll ${accountValues.length} accounts`);
 
@@ -823,15 +892,22 @@ class PollingAccountsFetcher {
                 accIndex -= this.MAX_KEYS;
             }
             try {
-                const raw: string = (response as any).result.value[ accIndex ].data[0];
-                const dataType = (response as any).result.value[ accIndex ].data[1] as BufferEncoding;
-                const account = this.constructAccount(accountToPoll, raw, dataType);
-                if (accountToPoll.raw !== raw) {
-                    accountToPoll.data = account;
-                    accountToPoll.raw = raw;
-                    accountToPoll.onFetch(account);
+                if ((response as any).result.value[ accIndex ] !== null) {
+                    const raw: string = (response as any).result.value[ accIndex ].data[0];
+                    const dataType = (response as any).result.value[ accIndex ].data[1] as BufferEncoding;
+                    const account = this.constructAccount(accountToPoll, raw, dataType);
+                    if (accountToPoll.raw !== raw) {
+                        accountToPoll.data = account;
+                        accountToPoll.raw = raw;
+                        accountToPoll.onFetch(account);
+                    }
+                } else {
+                    console.warn(`account returned null: ${accountToPoll.accountPublicKey} - ${accountToPoll.accountKey}, removing!`);
+                    this.accounts.delete(accountToPoll.accountPublicKey);
                 }
+                
             } catch (error) {
+                // console.log(response, responseIndex, responses.length, accIndex, x, accountToPoll.accountKey, accountToPoll.accountPublicKey, accountToPoll.data);
                 accountToPoll.onError(error);
             }
         }
