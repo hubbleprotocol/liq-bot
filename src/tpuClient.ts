@@ -71,10 +71,11 @@ export class LeaderTpuCache {
                         leaderSockets.push(tpu_socket);
                     }
                 } else {
-                    console.log('TPU not available for leader: ', leader.toBase58());
+                    // console.warn('TPU not available for leader: ', leader.toBase58());
                 }
                 checkedSlots++;
                 if (checkedSlots === fanout_slots) {
+                    console.log(leaderSockets.length);
                     resolve(leaderSockets);
                 }
             });

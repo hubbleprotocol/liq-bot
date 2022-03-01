@@ -21,10 +21,6 @@ async function getConfigs(): Promise<Array<Config>> {
     return (await axios.get('https://api.hubbleprotocol.io/config')).data as Array<Config>;
 }
 
-export function getMintFromConfig(config: Config, coin: string) : string {
-    return config.borrowing.accounts['liquidationRewardsVault'+coin[0].toUpperCase()+coin.substring(1).toLowerCase()];
-}
-
 function getWallet(): Wallet {
 	const botKeyEnvVariable = "BOT_KEY";
 	// ENVIRONMENT VARIABLE FOR THE BOT PRIVATE KEY
