@@ -5,7 +5,7 @@ import axios from "axios";
 import * as bs58 from 'bs58';
 import { BorrowingMarketState, CollateralAmounts, CollateralInfo, CollateralTokenActive, Config, LiquidationsQueue, SystemMode, TokenMap, TokenPrices, UserMetadata } from "./types";
 import BN from 'bn.js';
-import { TpuConnection } from "./tpuClient";
+import { TpuConnection } from "tpu-client";
 import { PriceData, parsePriceData, PriceStatus } from "@pythnetwork/client";
 import { DECIMAL_FACTOR, STABLECOIN_DECIMALS, LAMPORTS_PER_SOL, DECIMALS_BTC, LAMPORTS_PER_MSOL, DECIMALS_RAY, DECIMALS_FTT, DECIMALS_ETH, DECIMALS_SRM } from "@hubbleprotocol/hubble-sdk";
 import Decimal from "decimal.js";
