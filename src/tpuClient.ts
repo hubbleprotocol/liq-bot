@@ -75,7 +75,6 @@ export class LeaderTpuCache {
                 }
                 checkedSlots++;
                 if (checkedSlots === fanout_slots) {
-                    console.log(leaderSockets.length);
                     resolve(leaderSockets);
                 }
             });

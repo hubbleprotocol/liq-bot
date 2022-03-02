@@ -1,9 +1,9 @@
 import { Idl, Program, ProgramAccount, Provider, Wallet } from "@project-serum/anchor";
-import { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import {  getOrCreateAssociatedTokenAccount, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { AccountMeta, Cluster, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionInstruction } from "@solana/web3.js";
 import axios from "axios";
 import * as bs58 from 'bs58';
-import { BorrowingMarketState, CollateralAmounts, CollateralInfo, CollateralTokenActive, Config, EventStatus, LiquidationsQueue, SystemMode, TokenMap, TokenPrices, UserMetadata } from "./types";
+import { BorrowingMarketState, CollateralAmounts, CollateralInfo, CollateralTokenActive, Config, LiquidationsQueue, SystemMode, TokenMap, TokenPrices, UserMetadata } from "./types";
 import BN from 'bn.js';
 import { TpuConnection } from "./tpuClient";
 import { PriceData, parsePriceData, PriceStatus } from "@pythnetwork/client";
@@ -104,17 +104,12 @@ class Bot {
         // try to liquidate users every half second
         this.intervals.push(setInterval(async function() {
             this.liquidator.tryLiquidateUsers();
-        }.bind(this as Bot), 1000));
+        }.bind(this as Bot), 5));
     
         // get new users every 30 seconds
         this.intervals.push(setInterval(async function() {
             this.liquidator.getUserMetadatas();
-        }.bind(this as Bot), 30 * 1000));
-        
-        // get a new blockhash every second
-        this.intervals.push(setInterval(async function() {
-            this.liquidator.blockhash = (await this.liquidator.hubbleProgram.provider.connection.getRecentBlockhash()).blockhash;
-        }.bind(this as Bot), 1000));
+        }.bind(this as Bot), 10 * 1000));
     }
 
 
@@ -153,11 +148,10 @@ export class Liquidator {
     borrowingMarketState: BorrowingMarketState
     liquidationsQueue: LiquidationsQueue
     liquidatorAssociatedTokenAccounts: LiquidatorAssociatedTokenAccounts
-    userMetadataMap: Map<string, UserMetadata>;
-    liquidationIXMap: Map<string, TransactionInstruction>;
-    clearLiquidationGainsIXMap: Map<string, TransactionInstruction>;
-    pollingAccountsFetcher: PollingAccountsFetcher;
-    blockhash: string
+    userMetadataMap: Map<string, UserMetadata>
+    liquidationIXMap: Map<string, TransactionInstruction>
+    clearLiquidationGainsIXMap: Map<string, TransactionInstruction>
+    pollingAccountsFetcher: PollingAccountsFetcher
     prices: TokenPrices
     mcr: BN | Decimal
 
@@ -342,45 +336,38 @@ export class Liquidator {
 
 
     // clear the liquidation queue
-    async clearLiquidationQueue() : Promise<void> {
+    // async clearLiquidationQueue() : Promise<void> {
 
-        // filter the liquidation queue for events which are pending collection
-        const filteredLiquidationQueue = this.liquidationsQueue.events.filter(e => e.status.toNumber() === EventStatus.PendingCollection);
-        // loop through each liquidation event
-        await Promise.all(filteredLiquidationQueue.map((pendingEvent, index) => {
-            return new Promise((resolve) => { 
-                // 1 second timeout per liquidation event
-                setTimeout(async () => {
-                    resolve(await this.clearLiquidationGains());
-                }, 1000 * index);
-            });
-        }));
-    }
+    //     // filter the liquidation queue for events which are pending collection
+    //     const filteredLiquidationQueue = this.liquidationsQueue.events.filter(e => e.status.toNumber() === EventStatus.PendingCollection);
+    //     // loop through each liquidation event
+    //     const txs = flat(await Promise.all(filteredLiquidationQueue.map((pendingEvent, index) => {
+    //         return new Promise((resolve) => { 
+    //             // 1 second timeout per liquidation event
+    //             setTimeout(async () => {
+    //                 resolve(await this.clearLiquidationGains());
+    //             }, 1000 * index);
+    //         });
+    //     })));
+    //     txs.forEach(tx => {
+    //         console.log('https://solscan.io/tx/'+tx+(this.cluster === 'devnet' ?  '?cluster=devnet' : ''));
+    //     });
+    // }
 
-    //
+    // clear liquidation gains
     async clearLiquidationGains() : Promise<Array<string>> {
-        const chunkOf5Tokens = chunk(Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))), 5) as Array<Array<string>>;
-        return flat(await Promise.all(chunkOf5Tokens.map(async (chunkedTokenAccounts, chunkIndex) => {
-            return new Promise((resolve) => {
-                setTimeout(() => {
-                    const tx = new Transaction();
-                    chunkedTokenAccounts.forEach(async tokenAccount => {
-                        tx.add(this.clearLiquidationGainsIXMap.get(CollateralTokenActive[tokenAccount]));
-                    });
-                    tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
-                    tx.recentBlockhash = this.blockhash;
-                    this.hubbleProgram.provider.wallet.signTransaction(tx).then(tx => {
-                        (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize()).then(signature => {
-                            resolve(signature);
-                        });
-                    });
-                }, 1000 * chunkIndex);
-            });
+        const blockhash = (await this.hubbleProgram.provider.connection.getRecentBlockhash()).blockhash;
+        return flat(await Promise.all(Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))).map(async (token) => {
+            let tx = new Transaction();
+            tx.add(this.clearLiquidationGainsIXMap.get(token));
+            tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
+            tx.recentBlockhash = blockhash;
+            tx = await this.hubbleProgram.provider.wallet.signTransaction(tx);
+            return await (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize());
         })));
-        
     }
 
-
+    // get the pending debt of a user
     async getPendingDebt(user : UserMetadata) : Promise<Decimal> {
         const diffStableRpt = new Decimal(this.borrowingMarketState.stablecoinRewardPerToken.toString()).minus(new Decimal(user.userStablecoinRewardPerToken.toString()));
         return user.status !== 1 || diffStableRpt.isZero()
@@ -388,11 +375,13 @@ export class Liquidator {
             : diffStableRpt.mul(new Decimal(user.userStake.toString())).dividedBy(DECIMAL_FACTOR);
     }
 
+    // calculate the total debt of a user pending debt + borrowed stablecoin
     async calculateTotalDebt(user: UserMetadata) : Promise<Decimal> {
         const pendingDebt = await this.getPendingDebt(user);
         return new Decimal(user.borrowedStablecoin.toString()).plus(pendingDebt).dividedBy(new Decimal(STABLECOIN_DECIMALS));
     }
 
+    // helper function, init a new CollateralAmounts object
     zeroCollateral() : CollateralAmounts {
         const keys = Object.keys(this.borrowingMarketState.collateralRewardPerToken).filter(key => !Array.isArray(this.borrowingMarketState.collateralRewardPerToken[key]));
         const zeroCollateral = {} as TokenMap;
@@ -402,6 +391,7 @@ export class Liquidator {
         return zeroCollateral;
     }
 
+    // multiple the collateral amounts by a fraction
     mulFrac(collateralAmmounts: CollateralAmounts, numerator: BN | Decimal, denominator: BN | Decimal) : TokenMap {
         Object.keys(collateralAmmounts).filter(key => Array.isArray(collateralAmmounts[key])).forEach(key => {
             collateralAmmounts[key] = collateralAmmounts[key].dividedBy(denominator).mul(numerator);
@@ -410,7 +400,7 @@ export class Liquidator {
 
     }
 
-    // 
+    // get the pending collateral for a user
     async getPendingCollateral(user : UserMetadata) : Promise<CollateralAmounts> {
         const diffCollRpt = this.zeroCollateral() as CollateralAmounts;
         Object.keys(this.borrowingMarketState.collateralRewardPerToken).filter(key => !Array.isArray(this.borrowingMarketState.collateralRewardPerToken[key])).forEach(key => {
@@ -421,6 +411,7 @@ export class Liquidator {
             : this.mulFrac(diffCollRpt, new Decimal(user.userStake.toString()), DECIMAL_FACTOR);
     }
 
+    // add CollateralAmounts together
     async addCollateralAmounts(collateralAmounts: Array<CollateralAmounts>) : Promise<CollateralAmounts> {
         const keys = Object.keys(collateralAmounts[0]).filter(key => !Array.isArray(collateralAmounts[0][key]));
         return collateralAmounts.reduce((a, b) => {
@@ -493,21 +484,23 @@ export class Liquidator {
         // if (!(topLoan.tcr as Decimal).eq(new Decimal(0))) {
         //     console.log(`${topLoan.metadata.metadataPk.toBase58()} - ${(1/(topLoan.tcr.toNumber()/100) * 100).toFixed(2)} %`);
         // }
+        const mcrRange = (this.mcr as Decimal).plus(new Decimal(10 * 0.00008));
         sortedLoans.forEach(async loan => {
             // initially all loan tcr's will be ZERO
             if (!(loan.tcr as Decimal).eq(new Decimal(0))) {
-                const mcrRange = (this.mcr as Decimal).plus(new Decimal(10 * 0.0001));
-                const liquidatable = (loan.tcr as Decimal).lt(mcrRange);
+                const liquidatable = (loan.tcr as Decimal).lte(mcrRange);
                 const ltv = 1/(loan.tcr.toNumber()/100);
                 // console.log(`liquidatable ${liquidatable} - mcr ${mcrRange.toNumber()} - tcr: ${loan.tcr.toNumber().toFixed(2)} - ltv ${(ltv * 100).toFixed(2)}`);
                 
                 if (liquidatable) {
                     console.log(`${loan.metadata.metadataPk.toBase58()} has ltv ${(ltv * 100).toFixed(2)} attempting to liquidate`);
-                    let tx = new Transaction().add(this.liquidationIXMap.get(loan.metadata.metadataPk.toBase58()));
-                    tx.recentBlockhash = this.blockhash;
+                    let tx = new Transaction();
+                    tx = tx.add(this.liquidationIXMap.get(loan.metadata.metadataPk.toBase58()));
+                    tx.recentBlockhash = (await this.hubbleProgram.provider.connection.getRecentBlockhash()).blockhash;
                     tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
                     tx = await this.hubbleProgram.provider.wallet.signTransaction(tx);
-                    (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize());
+                    const signature = (this.hubbleProgram.provider.connection as TpuConnection).sendRawTransaction(tx.serialize());
+                    console.log('https://solscan.io/tx/' + signature + (this.cluster === 'devnet' ? '?cluster=devnet' : ''));
                 }
             }
         });
@@ -603,7 +596,7 @@ export class Liquidator {
                 return await Promise.all(chunkedTokens.map(token => {
                     return new Promise((resolve) => {
                         setTimeout(async () => {
-                            resolve({ token, pub: (await getAssociatedTokenAddress(new PublicKey(this.clusterConfig.borrowing.accounts.mint[token]), this.hubbleProgram.provider.wallet.publicKey)) });
+                            resolve({ token, pub: (await getOrCreateAssociatedTokenAccount(this.hubbleProgram.provider.connection, this.wallet.payer, new PublicKey(this.clusterConfig.borrowing.accounts.mint[token]), this.hubbleProgram.provider.wallet.publicKey)) });
                         }, 1000 * chunkIndex);
                     });
                 }));
@@ -646,9 +639,7 @@ export class Liquidator {
         const borrowingMarketState = (await hubbleProgram.account.borrowingMarketState.fetch(clusterConfig.borrowing.accounts.borrowingMarketState)) as BorrowingMarketState;
         // load liquidations queue
         const liquidationsQueue = (await hubbleProgram.account.liquidationsQueue.fetch(clusterConfig.borrowing.accounts.liquidationsQueue)) as LiquidationsQueue;
-        // load initial blockhash
-        const blockhash = (await hubbleProgram.provider.connection.getRecentBlockhash()).blockhash;
-        
+
         return new Liquidator(
             process.env.CLUSTER as Cluster,
             idl, 
@@ -657,13 +648,12 @@ export class Liquidator {
             wallet, 
             hubbleProgram, 
             borrowingMarketState,
-            liquidationsQueue,
-            blockhash
+            liquidationsQueue
         );
 
     }
 
-    constructor(cluster: Cluster, idl: Idl, configs: Array<Config>, clusterConfig: Config, wallet: Wallet, hubbleProgram: Program<Idl>, borrowingMarketState: BorrowingMarketState, liquidationsQueue: LiquidationsQueue, blockhash: string) {
+    constructor(cluster: Cluster, idl: Idl, configs: Array<Config>, clusterConfig: Config, wallet: Wallet, hubbleProgram: Program<Idl>, borrowingMarketState: BorrowingMarketState, liquidationsQueue: LiquidationsQueue) {
         // add the helper variables to this instance of the Liquidator
         this.cluster = cluster;
         this.idl = idl;
@@ -673,7 +663,6 @@ export class Liquidator {
         this.hubbleProgram = hubbleProgram;
         this.borrowingMarketState = borrowingMarketState;
         this.liquidationsQueue = liquidationsQueue;
-        this.blockhash = blockhash;
         
         // init clearLiquidationGains map
         this.clearLiquidationGainsIXMap = new Map<string, TransactionInstruction>();
@@ -696,6 +685,8 @@ export class Liquidator {
 
         
 
+        
+
         // minimum collateral ratio
         this.mcr = new Decimal(100);
         
@@ -707,7 +698,7 @@ export class Liquidator {
             this.liquidationsQueue = liquidationsQueue;
 
             // clear the liquidation queue
-            await this.clearLiquidationQueue();
+            await this.clearLiquidationGains();
         }), (error => {
             console.error(error);
         }), this.liquidationsQueue);
@@ -762,6 +753,7 @@ export interface AccountToPoll<T> {
     accountKey: string // account on the anchor program (used for decoding the buffer data returned by the rpc call)
     accountPublicKey: string
     program: Program<Idl>
+    slot: number
     constructAccount: (buffer: Buffer) => any
     onFetch: (data: T) => void
     onError: (error: any) => void
@@ -889,13 +881,17 @@ class PollingAccountsFetcher {
             }
             try {
                 if ((response as any).result.value[ accIndex ] !== null) {
-                    const raw: string = (response as any).result.value[ accIndex ].data[0];
-                    const dataType = (response as any).result.value[ accIndex ].data[1] as BufferEncoding;
-                    const account = this.constructAccount(accountToPoll, raw, dataType);
-                    if (accountToPoll.raw !== raw) {
-                        accountToPoll.data = account;
-                        accountToPoll.raw = raw;
-                        accountToPoll.onFetch(account);
+                    const slot = (response as any).result.context.slot;
+                    if (accountToPoll.slot === undefined || slot > accountToPoll.slot) {
+                        accountToPoll.slot = slot;
+                        const raw: string = (response as any).result.value[ accIndex ].data[0];
+                        const dataType = (response as any).result.value[ accIndex ].data[1] as BufferEncoding;
+                        const account = this.constructAccount(accountToPoll, raw, dataType);
+                        if (accountToPoll.raw !== raw) {
+                            accountToPoll.data = account;
+                            accountToPoll.raw = raw;
+                            accountToPoll.onFetch(account);
+                        }
                     }
                 } else {
                     console.warn(`account returned null: ${accountToPoll.accountPublicKey} - ${accountToPoll.accountKey}, removing!`);
