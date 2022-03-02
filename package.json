@@ -14,7 +14,8 @@
 		"denque": "^2.0.1",
 		"dgram": "^1.0.1",
 		"dotenv": "^10.0.0",
-		"json-diff": "^0.7.1"
+		"json-diff": "^0.7.1",
+		"polling-account-fetcher": "^1.0.5"
 	},
 	"devDependencies": {
 		"@types/node": "^17.0.21",

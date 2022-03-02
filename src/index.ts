@@ -9,6 +9,8 @@ import { TpuConnection } from "./tpuClient";
 import { PriceData, parsePriceData, PriceStatus } from "@pythnetwork/client";
 import { DECIMAL_FACTOR, STABLECOIN_DECIMALS, LAMPORTS_PER_SOL, DECIMALS_BTC, LAMPORTS_PER_MSOL, DECIMALS_RAY, DECIMALS_FTT, DECIMALS_ETH, DECIMALS_SRM } from "@hubbleprotocol/hubble-sdk";
 import Decimal from "decimal.js";
+import { PollingAccountsFetcher, flat, chunk } from 'polling-account-fetcher';
+
 
 require('dotenv').config();
 
@@ -67,6 +69,7 @@ class Bot {
         const configs = await getConfigs();
 
         const liquidator = await Liquidator.load(idl, configs);
+        
         return new Bot(liquidator);
     }
 
@@ -86,7 +89,9 @@ class Bot {
     
             const idl = await getIDL();
             const configs = await getConfigs();
+
             const bot = (this as Bot);
+
             if (JSON.stringify(bot.liquidator.idl) !== JSON.stringify(idl) && JSON.stringify(bot.liquidator.configs) !== JSON.stringify(configs)) {
                 bot.stop();
                 bot.liquidator = await Liquidator.load(idl, configs);
@@ -155,6 +160,90 @@ export class Liquidator {
     prices: TokenPrices
     mcr: BN | Decimal
 
+
+    constructor(cluster: Cluster, idl: Idl, configs: Array<Config>, clusterConfig: Config, wallet: Wallet, hubbleProgram: Program<Idl>, borrowingMarketState: BorrowingMarketState, liquidationsQueue: LiquidationsQueue) {
+        // add the helper variables to this instance of the Liquidator
+        this.cluster = cluster;
+        this.idl = idl;
+        this.configs = configs;
+        this.clusterConfig = clusterConfig;
+        this.wallet = wallet;
+        this.hubbleProgram = hubbleProgram;
+        this.borrowingMarketState = borrowingMarketState;
+        this.liquidationsQueue = liquidationsQueue;
+        
+        // init clearLiquidationGains map
+        this.clearLiquidationGainsIXMap = new Map<string, TransactionInstruction>();
+
+        // init liquidation map
+        this.liquidationIXMap = new Map<string, TransactionInstruction>();
+
+        // start loading the liquidator ATAs
+        // and create the clear liquidation gains IX
+        this.getLiquidatorAssociatedTokenAccounts().then(async liquidatorAssociatedTokenAccounts => {
+            this.liquidatorAssociatedTokenAccounts = liquidatorAssociatedTokenAccounts;
+            // for each active collateral token create a clear liquidation gains transaction instruction and save it to the map, since that will never change
+            Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))).forEach(async tokenAccount => {
+                this.clearLiquidationGainsIXMap.set(tokenAccount, await this.getClearLiquidationGainsIX(tokenAccount, new PublicKey(this.liquidatorAssociatedTokenAccounts[tokenAccount])));
+            });
+        });
+        
+
+        // minimum collateral ratio
+        this.mcr = new Decimal(100);
+        
+        // create the polling accounts fetcher
+        this.pollingAccountsFetcher = new PollingAccountsFetcher(500);
+
+        // add the liquidations queue PublicKey to the polling accounts fetcher
+        this.pollingAccountsFetcher.addProgram('liquidationsQueue', clusterConfig.borrowing.accounts.liquidationsQueue, this.hubbleProgram, (async (liquidationsQueue : LiquidationsQueue) => {
+            this.liquidationsQueue = liquidationsQueue;
+
+            // clear the liquidation queue
+            await this.clearLiquidationGains();
+        }), (error => {
+            console.error(error);
+        }), this.liquidationsQueue);
+
+        // add the borrowing market state PublicKey to the polling accounts fetcher
+        this.pollingAccountsFetcher.addProgram('borrowingMarketState', clusterConfig.borrowing.accounts.borrowingMarketState, this.hubbleProgram, (async (borrowingMarketState : BorrowingMarketState) => {
+            this.borrowingMarketState = borrowingMarketState;
+
+            // will need to recalculate the minimum collateral ratio
+            this.mcr = await this.calculateMcr();
+        }), (error => {
+            console.error(error);
+        }), this.borrowingMarketState);
+    
+
+        // initiate the token prices object
+        this.prices = {} as TokenPrices;
+
+        // loop through the PriceInfo PublicKeys from the pyth object on the cluster config
+        Object.keys(this.clusterConfig.borrowing.accounts.pyth).filter(key => key.includes('PriceInfo')).forEach(key => {
+
+            // set prices to zero temporarily
+            this.prices[key.split('Price')[0]] = { value: new Decimal(0), exp: new Decimal(0) };
+            
+            // add the PublicKey of the pyth oracle to the polling accounts fetcher
+            // since the @pythnetwork/client doesn't have an anchor IDL which I can load into a program
+            // instead this `addConstructAccount` will parse the price data returned from the rpc using `parsePriceData`
+            this.pollingAccountsFetcher.addConstructAccount(this.clusterConfig.borrowing.accounts.pyth[key], (data: Buffer) => {
+                return parsePriceData(data);
+            }, async (priceData: PriceData) => {
+                // sometimes the price/exponent is undefined because of the pyth oracle
+                if (priceData.price && priceData.exponent) {
+                    this.prices[key.split('Price')[0]] = { value: new Decimal(priceData.price), exp: new Decimal(priceData.exponent) };
+                    // calculate the minimum collateral ratio whenever the price changes
+                    this.mcr = await this.calculateMcr();
+                } else {
+                    console.log(`Pyth Oracle: ${priceData.productAccountKey.toBase58()} - ${Object.keys(this.clusterConfig.borrowing.accounts.pyth).map(key => ({ key, value: this.clusterConfig.borrowing.accounts.pyth[key] } )).find(keyValue => keyValue.value === priceData.productAccountKey.toBase58()).key.split("Pr")[0].toUpperCase()} - price ${PriceStatus[priceData.status]}`);
+                }
+            }, (error) => {
+                console.error(error);
+            });
+        });
+    }
 
     // create the clearLiquidationGains TransactionInstruction for the liquidator running this bot
     // will need to be called for each token
@@ -422,6 +511,8 @@ export class Liquidator {
         }, this.zeroCollateral());
     }
 
+    // this will need to be updated when new tokens get added
+
     precisionFromKey(key: string): Decimal {
         switch(key) {
             case 'sol': return new Decimal(LAMPORTS_PER_SOL);
@@ -596,15 +687,17 @@ export class Liquidator {
                 return await Promise.all(chunkedTokens.map(token => {
                     return new Promise((resolve) => {
                         setTimeout(async () => {
-                            resolve({ token, pub: (await getOrCreateAssociatedTokenAccount(this.hubbleProgram.provider.connection, this.wallet.payer, new PublicKey(this.clusterConfig.borrowing.accounts.mint[token]), this.hubbleProgram.provider.wallet.publicKey)) });
+                            resolve({ token, pub: (await getOrCreateAssociatedTokenAccount(this.hubbleProgram.provider.connection, this.wallet.payer, new PublicKey(this.clusterConfig.borrowing.accounts.mint[token]), this.hubbleProgram.provider.wallet.publicKey)).address });
                         }, 1000 * chunkIndex);
                     });
                 }));
             })).then(tokenAddresses => {
+            
                 flat(tokenAddresses).forEach((ata: { token: string, pub: PublicKey }) => {
                     // mint uses WSOL for the key, while ActiveCollateralToken uses SOL ...
                     liquidatorAssociatedTokenAccounts[ata.token === 'WSOL' ? 'SOL' : ata.token] = ata.pub.toBase58();
                 });
+
                 resolve(liquidatorAssociatedTokenAccounts);
             });
         });
@@ -629,6 +722,7 @@ export class Liquidator {
         // create the TPU Connection (will allow us to send more tx's to the tpu leaders (not rate limited))
         const connection = await TpuConnection.load(process.env.RPC_URL, { commitment: 'processed' });
 
+
         // wallet used as the liquidator and to sign/send transactions
         const wallet = getWallet();
 
@@ -651,258 +745,6 @@ export class Liquidator {
             liquidationsQueue
         );
 
-    }
-
-    constructor(cluster: Cluster, idl: Idl, configs: Array<Config>, clusterConfig: Config, wallet: Wallet, hubbleProgram: Program<Idl>, borrowingMarketState: BorrowingMarketState, liquidationsQueue: LiquidationsQueue) {
-        // add the helper variables to this instance of the Liquidator
-        this.cluster = cluster;
-        this.idl = idl;
-        this.configs = configs;
-        this.clusterConfig = clusterConfig;
-        this.wallet = wallet;
-        this.hubbleProgram = hubbleProgram;
-        this.borrowingMarketState = borrowingMarketState;
-        this.liquidationsQueue = liquidationsQueue;
-        
-        // init clearLiquidationGains map
-        this.clearLiquidationGainsIXMap = new Map<string, TransactionInstruction>();
-
-        // init liquidation map
-        this.liquidationIXMap = new Map<string, TransactionInstruction>();
-
-        // start loading the liquidator ATAs
-        // and create the clear liquidation gains IX
-        this.getLiquidatorAssociatedTokenAccounts().then(async liquidatorAssociatedTokenAccounts => {
-            this.liquidatorAssociatedTokenAccounts = liquidatorAssociatedTokenAccounts;
-            // for each active collateral token create a clear liquidation gains transaction instruction and save it to the map, since that will never change
-            Object.keys(CollateralTokenActive).filter(token => isNaN(parseInt(token))).forEach(async tokenAccount => {
-                this.clearLiquidationGainsIXMap.set(tokenAccount, await this.getClearLiquidationGainsIX(tokenAccount, new PublicKey(this.liquidatorAssociatedTokenAccounts[tokenAccount])));
-            });
-        });
-        
-
-        
-
-        
-
-        
-
-        // minimum collateral ratio
-        this.mcr = new Decimal(100);
-        
-        // create the polling accounts fetcher
-        this.pollingAccountsFetcher = new PollingAccountsFetcher(500);
-
-        // add the liquidations queue PublicKey to the polling accounts fetcher
-        this.pollingAccountsFetcher.addProgram('liquidationsQueue', clusterConfig.borrowing.accounts.liquidationsQueue, this.hubbleProgram, (async (liquidationsQueue : LiquidationsQueue) => {
-            this.liquidationsQueue = liquidationsQueue;
-
-            // clear the liquidation queue
-            await this.clearLiquidationGains();
-        }), (error => {
-            console.error(error);
-        }), this.liquidationsQueue);
-
-        // add the borrowing market state PublicKey to the polling accounts fetcher
-        this.pollingAccountsFetcher.addProgram('borrowingMarketState', clusterConfig.borrowing.accounts.borrowingMarketState, this.hubbleProgram, (async (borrowingMarketState : BorrowingMarketState) => {
-            this.borrowingMarketState = borrowingMarketState;
-
-            // will need to recalculate the minimum collateral ratio
-            this.mcr = await this.calculateMcr();
-        }), (error => {
-            console.error(error);
-        }), this.borrowingMarketState);
-    
-
-        // initiate the token prices object
-        this.prices = {} as TokenPrices;
-
-        // loop through the PriceInfo PublicKeys from the pyth object on the cluster config
-        Object.keys(this.clusterConfig.borrowing.accounts.pyth).filter(key => key.includes('PriceInfo')).forEach(key => {
-
-            // set prices to zero temporarily
-            this.prices[key.split('Price')[0]] = { value: new Decimal(0), exp: new Decimal(0) };
-            
-            // add the PublicKey of the pyth oracle to the polling accounts fetcher
-            // since the @pythnetwork/client doesn't have an anchor IDL which I can load into a program
-            // instead this `addConstructAccount` will parse the price data returned from the rpc using `parsePriceData`
-            this.pollingAccountsFetcher.addConstructAccount(this.clusterConfig.borrowing.accounts.pyth[key], (data: Buffer) => {
-                return parsePriceData(data);
-            }, async (priceData: PriceData) => {
-                // sometimes the price/exponent is undefined because of the pyth oracle
-                if (priceData.price && priceData.exponent) {
-                    this.prices[key.split('Price')[0]] = { value: new Decimal(priceData.price), exp: new Decimal(priceData.exponent) };
-                    // calculate the minimum collateral ratio whenever the price changes
-                    this.mcr = await this.calculateMcr();
-                } else {
-                    console.log(`Pyth Oracle: ${priceData.productAccountKey.toBase58()} - ${Object.keys(this.clusterConfig.borrowing.accounts.pyth).map(key => ({ key, value: this.clusterConfig.borrowing.accounts.pyth[key] } )).find(keyValue => keyValue.value === priceData.productAccountKey.toBase58()).key.split("Pr")[0].toUpperCase()} - price ${PriceStatus[priceData.status]}`);
-                }
-            }, (error) => {
-                console.error(error);
-            });
-        });
-    }
-}
-
-// this is the account which the polling accounts fetcher will use
-// fetch the accountPublicKey
-
-export interface AccountToPoll<T> {
-    data: T // the data 
-    raw: string
-    accountKey: string // account on the anchor program (used for decoding the buffer data returned by the rpc call)
-    accountPublicKey: string
-    program: Program<Idl>
-    slot: number
-    constructAccount: (buffer: Buffer) => any
-    onFetch: (data: T) => void
-    onError: (error: any) => void
-}
-
-
-export function chunk(array: Array<any>, chunk_size: number) : Array<any> {
-    return new Array(Math.ceil(array.length / chunk_size)).fill(null).map((_, index) => index * chunk_size).map(begin => array.slice(begin, begin + chunk_size));
-}
-
-export function flat(arr: Array<any>, d = 1) : Array<any> {
-    return d > 0 ? arr.reduce((acc, val) => acc.concat(Array.isArray(val) ? flat(val, d - 1) : val), []) : arr.slice();
-}
-
-
-class PollingAccountsFetcher {
-    accounts: Map<string, AccountToPoll<any>>
-    MAX_KEYS = 100
-    frequency: number
-    interval: NodeJS.Timer
-    constructor(frequency: number) {
-        this.frequency = frequency;
-        this.accounts = new Map<string, AccountToPoll<any>>();
-    }
-
-    addProgram(accountKey: string, accountPublicKey: string, program: Program<Idl>, onFetch: (data: any) => void, onError: (error: any) => void, data?: any) {
-        if (!this.accounts.has(accountPublicKey)) {
-            this.accounts.set(accountPublicKey, { accountKey, accountPublicKey, program, onFetch, onError, data } as AccountToPoll<any>);
-        }
-    }
-
-    addConstructAccount(accountPublicKey: string, constructAccount: (data: any) => any, onFetch: (data: any) => void, onError: (error: any) => void, data?: any) {
-        if (!this.accounts.has(accountPublicKey)) {
-            this.accounts.set(accountPublicKey, { accountPublicKey, constructAccount, onFetch, onError, data } as AccountToPoll<any>);
-        }
-    }
-
-    start() {
-        if(this.interval) {
-            clearInterval(this.interval);   
-        }
-        this.interval = setInterval(() => {
-            this.fetch();
-        }, this.frequency);
-    }
-
-    stop() {
-        if(this.interval) {
-            clearInterval(this.interval);
-        }
-    }
-
-    capitalize(value: string): string {
-		return value[0].toUpperCase() + value.slice(1);
-	}
-
-    constructAccount(accountToPoll: AccountToPoll<any>, raw: string, dataType: BufferEncoding) : any {
-        if (accountToPoll.program !== undefined) {
-            return accountToPoll.program.account[
-                accountToPoll.accountKey
-            ].coder.accounts.decode(
-                this.capitalize(accountToPoll.accountKey),
-                Buffer.from(raw, dataType)
-            );
-        } else if (accountToPoll.constructAccount !== undefined) {
-            return accountToPoll.constructAccount(Buffer.from(raw, dataType));
-        }
-        
-    }
-
-    axiosPost(requestChunk, retry = 0) : Promise<any> {
-        return new Promise((resolve) => {
-            const data = requestChunk.map(payload => 
-                ({
-                    jsonrpc: "2.0",
-                    id: "1",
-                    method: "getMultipleAccounts",
-                    params: [
-                        payload,
-                        { commitment: "processed" },
-                    ]
-                })
-            );
-            axios.post(process.env.RPC_URL, data).then(response => {
-                resolve(response.data);
-            }).catch(error => {
-                if (retry < 5) {
-                    this.axiosPost(requestChunk, retry+1);
-                } else {
-                    console.error(error);
-                    console.warn('failed to retrieve data 5 times in a row, aborting');
-                }
-            });
-        });
-    }
-
-    async fetch() : Promise<void> {
-        const accountValues = [...this.accounts.values()];
-        // chunk accounts into groups of 100, 1 request can have 10 groups of 100, genesysgo can handle 10 requests a second (so we use 5 to not get rate limited)
-        // this will handle 5k accounts every second :D
-        const chunked = chunk(chunk(chunk(accountValues.map(x => x.accountPublicKey), this.MAX_KEYS), 10), 5);
-        // const start = process.hrtime();
-        const responses = flat(await Promise.all(chunked.map((request, index) => {
-            return new Promise((resolve) => {
-                setTimeout(() => {
-                    Promise.all(request.map((requestChunk) => {
-                        return this.axiosPost(requestChunk);
-                    })).then(promisedResponses => {
-                        resolve(flat(promisedResponses, Infinity));
-                    });
-                }, index * 1000);
-            });
-        })), Infinity);
-
-        // const end = process.hrtime(start);
-        // console.log(`took ${ ((end[0] * 1000) + (end[1] / 1000000)).toFixed(2) } ms to poll ${accountValues.length} accounts`);
-
-        for(let x = 0; x < accountValues.length; x++) {
-            const accountToPoll = accountValues[x];
-            let accIndex = x;
-            const responseIndex = Math.floor(accIndex / this.MAX_KEYS);
-            const response = responses[responseIndex];
-            while (accIndex >= this.MAX_KEYS) {
-                accIndex -= this.MAX_KEYS;
-            }
-            try {
-                if ((response as any).result.value[ accIndex ] !== null) {
-                    const slot = (response as any).result.context.slot;
-                    if (accountToPoll.slot === undefined || slot > accountToPoll.slot) {
-                        accountToPoll.slot = slot;
-                        const raw: string = (response as any).result.value[ accIndex ].data[0];
-                        const dataType = (response as any).result.value[ accIndex ].data[1] as BufferEncoding;
-                        const account = this.constructAccount(accountToPoll, raw, dataType);
-                        if (accountToPoll.raw !== raw) {
-                            accountToPoll.data = account;
-                            accountToPoll.raw = raw;
-                            accountToPoll.onFetch(account);
-                        }
-                    }
-                } else {
-                    console.warn(`account returned null: ${accountToPoll.accountPublicKey} - ${accountToPoll.accountKey}, removing!`);
-                    this.accounts.delete(accountToPoll.accountPublicKey);
-                }
-                
-            } catch (error) {
-                // console.log(response, responseIndex, responses.length, accIndex, x, accountToPoll.accountKey, accountToPoll.accountPublicKey, accountToPoll.data);
-                accountToPoll.onError(error);
-            }
-        }
     }
 }
 
