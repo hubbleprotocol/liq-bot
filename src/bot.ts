@@ -46,6 +46,7 @@ export class Bot {
         // retrieve the configs from the https api
         const configs = await getConfigs();
 
+        // use the static async function load instead of class constructor
         const liquidator = await Liquidator.load(idl, configs);
         
         return new Bot(liquidator);

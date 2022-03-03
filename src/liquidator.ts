@@ -2,44 +2,15 @@ import { DECIMAL_FACTOR, STABLECOIN_DECIMALS, DECIMALS_BTC, LAMPORTS_PER_MSOL, D
 import { Idl, Wallet, Program, BN, ProgramAccount, Provider } from "@project-serum/anchor";
 import { parsePriceData, PriceData, PriceStatus } from "@pythnetwork/client";
 import { TOKEN_PROGRAM_ID, getOrCreateAssociatedTokenAccount } from "@solana/spl-token";
-import { Cluster, TransactionInstruction, PublicKey, SYSVAR_CLOCK_PUBKEY, AccountMeta, Transaction, LAMPORTS_PER_SOL, Keypair } from "@solana/web3.js";
+import { Cluster, TransactionInstruction, PublicKey, SYSVAR_CLOCK_PUBKEY, AccountMeta, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { Config, BorrowingMarketState, LiquidationsQueue, LiquidatorAssociatedTokenAccounts, UserMetadata, TokenPrices, CollateralTokenActive, CollateralAmounts, TokenMap, Loan, CollateralInfo, SystemMode } from "./types";
 import { PollingAccountsFetcher, flat, chunk } from 'polling-account-fetcher';
 import { TpuConnection } from 'tpu-client';
 import Decimal from "decimal.js";
-import * as bs58 from 'bs58';
+import { getWallet } from "./utils";
 
 import { config } from 'dotenv';
 config();
-
-function getWallet(): Wallet {
-	const botKeyEnvVariable = "BOT_KEY";
-	// ENVIRONMENT VARIABLE FOR THE BOT PRIVATE KEY
-	const botKey = process.env[botKeyEnvVariable];
-
-	if (botKey === undefined) {
-		console.error('need a ' + botKeyEnvVariable +' env variable');
-		process.exit();
-	}
-	// setup wallet
-	let keypair : Keypair;
-
-	try {
-		keypair = Keypair.fromSecretKey(
-			bs58.decode(botKey)
-		);
-	} catch {
-		try {
-			keypair = Keypair.fromSecretKey(
-				Uint8Array.from(JSON.parse(botKey))
-			);
-		} catch {
-			console.error('Failed to parse private key from Uint8Array (solana-keygen) and base58 encoded string (phantom wallet export)');
-			process.exit();
-		}
-	}
-	return new Wallet(keypair);
-}
 
 export class Liquidator {
     cluster: Cluster
