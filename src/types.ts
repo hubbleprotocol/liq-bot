@@ -2,6 +2,19 @@ import { BN } from "@project-serum/anchor";
 import { Cluster, PublicKey } from "@solana/web3.js";
 import Decimal from "decimal.js";
 
+
+
+export type LiquidatorAssociatedTokenAccounts = {
+    [key in CollateralTokenActive]: string;
+};
+
+export type Loan = {
+    metadata: UserMetadata,
+    usdhDebt: BN | Decimal
+    collateral: CollateralAmounts,
+    tcr: BN | Decimal
+}
+
 export type SerumMarket = {
     marketAddress: string
     requestQueue: string
