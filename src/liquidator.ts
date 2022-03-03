@@ -425,8 +425,8 @@ export class Liquidator {
         }))).map((loan) => {
             return {
                 ...loan,
-                tcr: Object.keys(loan.collateral).filter(key => !Array.isArray( loan.collateral[key] ) ).map(key => (new Decimal(loan.collateral[key].toString())).mul(this.prices[key].value)).reduce((a, b) => a.plus(b), new Decimal(0)).div((new Decimal(loan.usdhDebt.toString()))).mul(new Decimal(100))
-            };
+                icr: Object.keys(loan.collateral).filter(key => !Array.isArray( loan.collateral[key] ) ).map(key => (new Decimal(loan.collateral[key].toString())).mul(this.prices[key].value)).reduce((a, b) => a.plus(b), new Decimal(0)).div((new Decimal(loan.usdhDebt.toString()))).mul(new Decimal(100))
+            } as Loan;
         });
     }
 
@@ -439,7 +439,7 @@ export class Liquidator {
 
         const loans = await this.getLoans([...this.pollingAccountsFetcher.accounts.values()].filter(acc => acc.accountKey === 'userMetadata').map(acc => acc.data as UserMetadata));
         // loop through each loan and try to liquidate
-        const sortedLoans = loans.sort((loanA, loanB) => loanA.tcr.toNumber() - loanB.tcr.toNumber());
+        const sortedLoans = loans.sort((loanA, loanB) => loanA.icr.toNumber() - loanB.icr.toNumber());
         // const topLoan = sortedLoans[0];
         // if (!(topLoan.tcr as Decimal).eq(new Decimal(0))) {
         //     console.log(`${topLoan.metadata.metadataPk.toBase58()} - ${(1/(topLoan.tcr.toNumber()/100) * 100).toFixed(2)} %`);
@@ -447,9 +447,9 @@ export class Liquidator {
         const mcrRange = (this.mcr as Decimal).plus(new Decimal(10 * 0.00008));
         sortedLoans.forEach(async loan => {
             // initially all loan tcr's will be ZERO
-            if (!(loan.tcr as Decimal).eq(new Decimal(0))) {
-                const liquidatable = (loan.tcr as Decimal).lte(mcrRange);
-                const ltv = 1/(loan.tcr.toNumber()/100);
+            if (!(loan.icr as Decimal).eq(new Decimal(0))) {
+                const liquidatable = (loan.icr as Decimal).lte(mcrRange);
+                const ltv = 1/(loan.icr.toNumber()/100);
                 // console.log(`liquidatable ${liquidatable} - mcr ${mcrRange.toNumber()} - tcr: ${loan.tcr.toNumber().toFixed(2)} - ltv ${(ltv * 100).toFixed(2)}`);
                 
                 if (liquidatable) {

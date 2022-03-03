@@ -12,7 +12,7 @@ export type Loan = {
     metadata: UserMetadata,
     usdhDebt: BN | Decimal
     collateral: CollateralAmounts,
-    tcr: BN | Decimal
+    icr: BN | Decimal
 }
 
 export type SerumMarket = {
