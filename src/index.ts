@@ -1,8 +1,9 @@
-import { Bot } from "./bot";
+import { Bot } from './bot';
 
 async function main() {
-    const bot = await Bot.create();
-    bot.start();
+  const bot = await Bot.create();
+  bot.start();
 }
 
 main();
+
