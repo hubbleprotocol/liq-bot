@@ -30,7 +30,7 @@ export enum SystemMode {
 }
 
 export type Config = {
-  env: Cluster;
+  cluster: Cluster;
   borrowing: {
     programId: string;
     accounts: {
