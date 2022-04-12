@@ -914,7 +914,7 @@ export class Liquidator {
 
     // load the config pertaining to the environment of the bot
     const clusterConfig = configs.find(
-      (c) => c.env.toString() === (process.env.CLUSTER as Cluster).toString()
+      (c) => c.cluster.toString() === (process.env.CLUSTER as Cluster).toString()
     );
 
     // create the TPU Connection (will allow us to send more tx's to the tpu leaders (not rate limited))
