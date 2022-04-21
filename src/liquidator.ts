@@ -681,6 +681,7 @@ export class Liquidator {
 
   // get the loans for each userMetadata
   async tryLiquidateUsers(): Promise<void> {
+    console.log('Trying to liquidate');
     // get loan (tcr) associated with each user metadata
     // filter for the account data from the polling account fetcher which have userMetadata as the accountKey
     // this will save the most RAM since these accounts are going to be taking up the most of the accounts memory allocation
@@ -702,9 +703,14 @@ export class Liquidator {
     sortedLoans.forEach(async (loan) => {
       // initially all loan tcr's will be ZERO
       if (!(loan.icr as Decimal).eq(new Decimal(0))) {
+        console.log('Loan ICR', loan.icr as Decimal, 'vs', mcrRange);
         const liquidatable = (loan.icr as Decimal).lte(mcrRange);
         const ltv = 1 / (loan.icr.toNumber() / 100);
-        // console.log(`liquidatable ${liquidatable} - mcr ${mcrRange.toNumber()} - tcr: ${loan.tcr.toNumber().toFixed(2)} - ltv ${(ltv * 100).toFixed(2)}`);
+        // console.log(
+        //   `liquidatable ${liquidatable} - mcr ${mcrRange.toNumber()} - tcr: ${loan.tcr
+        //     .toNumber()
+        //     .toFixed(2)} - ltv ${(ltv * 100).toFixed(2)}`
+        // );
 
         if (liquidatable) {
           console.log(
@@ -721,7 +727,7 @@ export class Liquidator {
           ).blockhash;
           tx.feePayer = this.hubbleProgram.provider.wallet.publicKey;
           tx = await this.hubbleProgram.provider.wallet.signTransaction(tx);
-          const signature = (
+          const signature = await (
             this.hubbleProgram.provider.connection as TpuConnection
           ).sendRawTransaction(tx.serialize());
           console.log(
@@ -732,6 +738,7 @@ export class Liquidator {
         }
       }
     });
+    console.log('End try liquidate');
   }
 
   async getUserMetadatas(): Promise<void> {
@@ -845,7 +852,8 @@ export class Liquidator {
   async calculateMcr(): Promise<BN | Decimal> {
     const [mode, _tcr] = await this.calculateSystemMode();
     if (SystemMode.Normal === mode) {
-      return new Decimal(110);
+      // return new Decimal(110);
+      return new Decimal(140);
     } else if (SystemMode.Recovery === mode) {
       return new Decimal(150);
     }
@@ -914,7 +922,8 @@ export class Liquidator {
 
     // load the config pertaining to the environment of the bot
     const clusterConfig = configs.find(
-      (c) => c.env.toString() === (process.env.CLUSTER as Cluster).toString()
+      (c) =>
+        c.cluster.toString() === (process.env.CLUSTER as Cluster).toString()
     );
 
     // create the TPU Connection (will allow us to send more tx's to the tpu leaders (not rate limited))

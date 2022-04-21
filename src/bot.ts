@@ -106,7 +106,7 @@ export class Bot {
         async function () {
           this.liquidator.tryLiquidateUsers();
         }.bind(this as Bot),
-        5
+        0.5 * 1000 // miliseconds
       )
     );
 
@@ -116,7 +116,7 @@ export class Bot {
         async function () {
           this.liquidator.getUserMetadatas();
         }.bind(this as Bot),
-        10 * 1000
+        30 * 1000 // miliseconds
       )
     );
   }
